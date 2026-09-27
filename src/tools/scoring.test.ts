@@ -296,28 +296,62 @@ describe("scoreAllRecipes", () => {
 
 describe("score_recipes tool", () => {
   it("is registered with when-to-use and when-not-to-use guidance", () => {
-    const description = stub.tools.get("score_recipes")?.description ?? "";
+    const registration = stub.tools.get("score_recipes");
+    const description = registration?.description ?? "";
     expect(description).toContain("USE WHEN");
     expect(description).toContain("NOT FOR");
+    expect(registration?.outputSchema).toBeDefined();
   });
 
   it("says there is nothing to score when the library is empty", async () => {
     vi.mocked(store.getRecipes).mockResolvedValue([]);
-    const text = textOf(await callTool(stub, "score_recipes", {}));
+    const result = await callTool(stub, "score_recipes", {});
+    const text = textOf(result);
     expect(text).toContain("# Recipe scores (0 recipes)");
     expect(text).toContain("No recipes to score. Add recipes first.");
+    expect(result.structuredContent).toEqual({ currency: "DKK", recipes: [] });
   });
 
   it("renders cost, coverage, metadata, and the matched deal per recipe", async () => {
     vi.mocked(store.getRecipes).mockResolvedValue([beefRecipe()]);
     vi.mocked(api.searchDealsBatch).mockResolvedValue(new Map([["hakket oksekød", [beefOffer]]]));
 
-    const text = textOf(await callTool(stub, "score_recipes", {}));
+    const result = await callTool(stub, "score_recipes", {});
+    const text = textOf(result);
     expect(text).toContain("# Recipe scores (1 recipes)");
     expect(text).toContain("## Bolognese — 23 DKK (deals on 100% of ingredients)");
     expect(text).toContain("medium | italian | beef | 4 servings");
     expect(text).toContain("Deals:");
     expect(text).toContain("Hakket oksekød (500g): Hakket oksekød 8-12% — 23 DKK @ Netto");
+    expect(result.structuredContent).toEqual({
+      currency: "DKK",
+      recipes: [
+        {
+          name: "Bolognese",
+          servings: 4,
+          complexity: "medium",
+          proteinType: "beef",
+          cuisineType: "italian",
+          estimatedCost: 22.5,
+          dealCoverage: 100,
+          ingredients: [
+            {
+              name: "Hakket oksekød",
+              quantity: "500g",
+              category: "meat",
+              estimatedCost: 22.5,
+              confidence: "high",
+              bestDeal: {
+                heading: "Hakket oksekød 8-12%",
+                price: 22.5,
+                store: "Netto",
+              },
+              candidates: [],
+            },
+          ],
+        },
+      ],
+    });
   });
 
   it("uses the household country's currency", async () => {
@@ -329,8 +363,10 @@ describe("score_recipes tool", () => {
       new Map([["hakket oksekød", [{ ...beefOffer, store: "Prisma" }]]]),
     );
 
-    const text = textOf(await callTool(stub, "score_recipes", {}));
+    const result = await callTool(stub, "score_recipes", {});
+    const text = textOf(result);
     expect(text).toContain("EUR (deals on 100% of ingredients)");
+    expect(result.structuredContent).toMatchObject({ currency: "EUR" });
   });
 
   it("lists unmatched ingredients under a No deals line", async () => {
@@ -370,11 +406,35 @@ describe("score_recipes tool", () => {
       ]),
     );
 
-    const text = textOf(await callTool(stub, "score_recipes", {}));
+    const result = await callTool(stub, "score_recipes", {});
+    const text = textOf(result);
     expect(text).toContain("⚠ Uncertain matches (verify these):");
     expect(text).toContain("[low confidence]");
     expect(text).toContain("Other candidates:");
     expect(text).toContain("Sød mælk eller kærnemælk");
+    expect(result.structuredContent?.recipes).toEqual([
+      expect.objectContaining({
+        ingredients: [
+          expect.objectContaining({
+            confidence: "low",
+            candidates: [
+              expect.objectContaining({
+                heading: "Øko mælk eller fløde",
+                price: 12,
+                store: "Netto",
+                score: expect.any(Number),
+              }),
+              expect.objectContaining({
+                heading: "Sød mælk eller kærnemælk",
+                price: 14,
+                store: "Netto",
+                score: expect.any(Number),
+              }),
+            ],
+          }),
+        ],
+      }),
+    ]);
   });
 
   it("omits the plan section unless optimize is set", async () => {

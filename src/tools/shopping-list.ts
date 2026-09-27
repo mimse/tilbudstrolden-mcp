@@ -10,6 +10,7 @@ import {
   formatQuantity,
   parseQuantity,
   roundShare,
+  type ShoppingCost,
 } from "../scoring.js";
 import * as store from "../store.js";
 import { daysUntilExpiry, expiryTag, resolveStoreScope } from "./shared.js";
@@ -25,6 +26,78 @@ interface AggregatedIngredient {
     recipeName: string;
   }>;
   fromRecipes: string[];
+}
+
+export interface ShoppingListDeal {
+  id: string;
+  heading: string;
+  price: number | null;
+  currency: string;
+  quantity: number | null;
+  unit: string | null;
+  pricePerUnit: string | null;
+  store: string;
+  storeId: string;
+  validFrom: string | null;
+  validUntil: string | null;
+}
+
+export interface ShoppingListItem {
+  name: string;
+  category: string;
+  displayQuantity: string;
+  requiredQuantity: { amount: number; unit: string } | null;
+  sourceRecipes: string[];
+  contributions: Array<{
+    recipeName: string;
+    quantity: string;
+    recipeServings: number;
+  }>;
+  confidence: "high" | "low" | "none";
+  estimatedCost: number;
+  deal: ShoppingListDeal | null;
+  purchase: ShoppingCost | null;
+  alternatives: Array<{ offer: ShoppingListDeal; score: number }>;
+  expiringSoon: boolean;
+}
+
+export interface ShoppingListData {
+  status: "ok" | "no_matching_recipes";
+  requestedRecipes: string[];
+  availableRecipes: string[];
+  matchedRecipes: string[];
+  householdSize: number | null;
+  currency: string | null;
+  currencySymbol: string | null;
+  estimatedTotal: number;
+  items: ShoppingListItem[];
+  skippedPantry: string[];
+}
+
+export interface DetailedShoppingList {
+  text: string;
+  data: ShoppingListData;
+}
+
+interface ShoppingListMetadata {
+  requestedRecipes?: string[];
+  availableRecipes?: string[];
+}
+
+function toShoppingListDeal(offer: Offer): ShoppingListDeal {
+  return {
+    id: offer.id,
+    heading: offer.heading,
+    price: offer.price,
+    currency: offer.currency,
+    quantity: offer.quantity,
+    unit: offer.unit,
+    pricePerUnit: offer.pricePerUnit,
+    store: offer.store,
+    storeId: offer.storeId,
+    validFrom: offer.validFrom ?? null,
+    validUntil: offer.validUntil ?? null,
+  };
 }
 
 /** Collect and aggregate ingredients across recipes, skipping pantry items */
@@ -116,7 +189,7 @@ function formatIngredientDeal(
   aggregated: ReturnType<typeof aggregateQuantities>,
   householdSize: number,
   currencySymbol: string,
-): { line: string; cost: number } {
+): { line: string; cost: number; purchase: ShoppingCost | null } {
   const storeName = best.store;
   const validTo = best.validUntil?.slice(0, 10) ?? "unknown";
   const conf = confidence === "low" ? " ⚠" : "";
@@ -146,12 +219,14 @@ function formatIngredientDeal(
     return {
       line: `${ing.name}: need ${displayQty} -> ${packInfo} = ${shopping.totalCost} ${currencySymbol} [${formatQuantity(shopping.packSize, shopping.unitNeeded)}/pack${shopping.unitPrice ? `, ${shopping.unitPrice}` : ""}]${leftoverInfo} -- ${best.heading} @ ${storeName} until ${validTo}${expiry}${conf}`,
       cost: shopping.totalCost,
+      purchase: shopping,
     };
   }
 
   return {
     line: `${ing.name} (${displayQty}): ${best.heading} - ${best.price} ${best.currency}${best.pricePerUnit ? ` (${best.pricePerUnit})` : ""} @ ${storeName} until ${validTo}${expiry}${conf}`,
     cost: best.price ?? 0,
+    purchase: null,
   };
 }
 
@@ -182,6 +257,7 @@ interface IngredientShoppingResult {
   uncertain?: string;
   expiring?: string;
   cost: number;
+  item: ShoppingListItem;
 }
 
 function uncertainAlternativesLine(
@@ -211,16 +287,33 @@ function processIngredientForList(
   const { dealMap, preferredStores, locale, householdSize } = ctx;
   const result = findBestDeal(ing, dealMap, preferredStores, locale);
   const { displayQty, aggregated } = buildDisplayQuantity(ing, householdSize);
+  const common = {
+    name: ing.name,
+    category: ing.category,
+    displayQuantity: displayQty,
+    requiredQuantity: aggregated ? { amount: aggregated.totalAmount, unit: aggregated.unit } : null,
+    sourceRecipes: [...ing.fromRecipes],
+    contributions: ing.contributions.map((contribution) => ({ ...contribution })),
+  };
 
   if (!result.best) {
     return {
       regular: `${ing.name} (${displayQty}) [${ing.fromRecipes.join(", ")}]`,
       cost: 0,
+      item: {
+        ...common,
+        confidence: "none",
+        estimatedCost: 0,
+        deal: null,
+        purchase: null,
+        alternatives: [],
+        expiringSoon: false,
+      },
     };
   }
 
   const best = result.best;
-  const { line, cost } = formatIngredientDeal(
+  const { line, cost, purchase } = formatIngredientDeal(
     ing,
     best,
     result.confidence as "high" | "low",
@@ -234,6 +327,21 @@ function processIngredientForList(
     storeName: best.store,
     storeLine: line,
     cost,
+    item: {
+      ...common,
+      confidence: result.confidence,
+      estimatedCost: cost,
+      deal: toShoppingListDeal(best),
+      purchase,
+      alternatives:
+        result.confidence === "low"
+          ? result.candidates.slice(1).map((candidate) => ({
+              offer: toShoppingListDeal(candidate.offer),
+              score: candidate.score,
+            }))
+          : [],
+      expiringSoon: daysUntilExpiry(best.validUntil) <= 2,
+    },
   };
 
   if (daysUntilExpiry(best.validUntil) <= 2) {
@@ -255,16 +363,47 @@ export async function buildShoppingList(
   existingDealMap?: Map<string, Offer[]>,
   excludePantry = true,
 ): Promise<string> {
+  return (
+    await buildShoppingListDetailed(selectedRecipes, householdSize, existingDealMap, excludePantry)
+  ).text;
+}
+
+/** Build both the legacy text and its structured shopping-list representation. */
+export async function buildShoppingListDetailed(
+  selectedRecipes: store.Recipe[],
+  householdSize: number,
+  existingDealMap?: Map<string, Offer[]>,
+  excludePantry = true,
+  metadata: ShoppingListMetadata = {},
+): Promise<DetailedShoppingList> {
   const pantry = excludePantry ? await store.getPantry() : [];
   const pantrySet = new Set(pantry.map((p) => p.toLowerCase()));
   const household = await store.getHousehold();
   const locale = getLocale(household.country);
   const scope = resolveStoreScope(household, locale);
   const preferredStores = scope.names;
+  const matchedRecipes = selectedRecipes.map((recipe) => recipe.name);
+  const requestedRecipes = metadata.requestedRecipes ?? matchedRecipes;
+  const availableRecipes = metadata.availableRecipes ?? matchedRecipes;
+  const skippedPantry = findSkippedPantry(pantry, selectedRecipes);
 
   const allIngredients = collectIngredients(selectedRecipes, pantrySet);
   if (allIngredients.size === 0) {
-    return "All ingredients are in your pantry. Nothing to buy!";
+    return {
+      text: "All ingredients are in your pantry. Nothing to buy!",
+      data: {
+        status: "ok",
+        requestedRecipes,
+        availableRecipes,
+        matchedRecipes,
+        householdSize,
+        currency: locale.currency,
+        currencySymbol: locale.currencySymbol,
+        estimatedTotal: 0,
+        items: [],
+        skippedPantry,
+      },
+    };
   }
 
   const dealMap = await resolveDealMap(existingDealMap, allIngredients, locale, scope.dealerIds);
@@ -276,13 +415,28 @@ export async function buildShoppingList(
     householdSize,
   });
 
-  return formatShoppingOutput({
+  const text = formatShoppingOutput({
     ...tally,
     selectedRecipes,
     householdSize,
     pantry,
     currencySymbol: locale.currencySymbol,
   });
+  return {
+    text,
+    data: {
+      status: "ok",
+      requestedRecipes,
+      availableRecipes,
+      matchedRecipes,
+      householdSize,
+      currency: locale.currency,
+      currencySymbol: locale.currencySymbol,
+      estimatedTotal: tally.grandTotal,
+      items: tally.items,
+      skippedPantry,
+    },
+  };
 }
 
 /** Running totals collected while matching each ingredient against the deal map */
@@ -292,10 +446,12 @@ interface ShoppingTally {
   uncertainItems: string[];
   expiringWarnings: string[];
   grandTotal: number;
+  items: ShoppingListItem[];
 }
 
 function addToTally(tally: ShoppingTally, r: IngredientShoppingResult): void {
   tally.grandTotal += r.cost;
+  tally.items.push(r.item);
   if (r.expiring) tally.expiringWarnings.push(r.expiring);
   if (r.uncertain) tally.uncertainItems.push(r.uncertain);
   if (r.regular) tally.regularPrice.push(r.regular);
@@ -350,6 +506,7 @@ function tallyIngredients(
     uncertainItems: [],
     expiringWarnings: [],
     grandTotal: 0,
+    items: [],
   };
   for (const [, ing] of mergeSharedOffers(allIngredients, ctx)) {
     addToTally(tally, processIngredientForList(ing, ctx));

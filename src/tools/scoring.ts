@@ -247,6 +247,61 @@ interface ScoreRecipesArgs {
   preferCuisines?: Record<string, number>;
 }
 
+const dealCandidateOutputSchema = z.object({
+  heading: z.string(),
+  price: z.number(),
+  store: z.string(),
+  score: z.number(),
+});
+
+const scoredIngredientOutputSchema = z.object({
+  name: z.string(),
+  quantity: z.string(),
+  category: z.string(),
+  estimatedCost: z.number(),
+  confidence: z.enum(["high", "low", "none"]),
+  bestDeal: z
+    .object({
+      heading: z.string(),
+      price: z.number(),
+      store: z.string(),
+    })
+    .nullable(),
+  candidates: z.array(dealCandidateOutputSchema),
+});
+
+const scoredRecipeOutputSchema = z.object({
+  name: z.string(),
+  servings: z.number(),
+  complexity: z.string(),
+  proteinType: z.string(),
+  cuisineType: z.string(),
+  estimatedCost: z.number(),
+  dealCoverage: z.number(),
+  ingredients: z.array(scoredIngredientOutputSchema),
+});
+
+function toStructuredRecipes(scored: ScoredRecipe[]) {
+  return scored.map((recipe) => ({
+    name: recipe.name,
+    servings: recipe.servings,
+    complexity: recipe.complexity,
+    proteinType: recipe.proteinType,
+    cuisineType: recipe.cuisineType,
+    estimatedCost: recipe.estimatedCost,
+    dealCoverage: recipe.dealCoverage,
+    ingredients: recipe.ingredients.map((ingredient) => ({
+      name: ingredient.name,
+      quantity: ingredient.quantity,
+      category: ingredient.category,
+      estimatedCost: ingredient.estimatedCost,
+      confidence: ingredient.confidence,
+      bestDeal: ingredient.bestDeal,
+      candidates: ingredient.candidates ?? [],
+    })),
+  }));
+}
+
 /** Render the optimized day-by-day plan, or an explanation of why none was found */
 function formatOptimizedPlan(
   scored: ScoredRecipe[],
@@ -316,6 +371,10 @@ async function handleScoreRecipes(args: ScoreRecipesArgs) {
 
     return {
       content: [{ type: "text" as const, text: parts.join("\n") }],
+      structuredContent: {
+        currency: locale.currency,
+        recipes: toStructuredRecipes(scored),
+      },
     };
   } catch (err) {
     return errorResult(`Failed to score recipes: ${err instanceof Error ? err.message : err}`);
@@ -374,6 +433,10 @@ export function registerScoringTools(server: McpServer): void {
           .describe(
             'Soft cuisine preferences: {"asian": 3} = prefer at least 3 Asian dishes. Best-effort, won\'t fail if impossible.',
           ),
+      },
+      outputSchema: {
+        currency: z.string(),
+        recipes: z.array(scoredRecipeOutputSchema),
       },
       annotations: { readOnlyHint: true },
     },

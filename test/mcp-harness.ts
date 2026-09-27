@@ -15,6 +15,7 @@ import { z, type ZodRawShape } from "zod";
 
 export interface ToolResult {
   content: Array<{ type: string; text: string }>;
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }
 
@@ -26,6 +27,7 @@ export interface CapturedTool {
   name: string;
   description: string;
   schema: ZodRawShape;
+  outputSchema: ZodRawShape | undefined;
   annotations: ToolAnnotations | undefined;
   handler: (
     args: Record<string, unknown>,
@@ -61,6 +63,7 @@ export function createServerStub(): ServerStub {
       config: {
         description: string;
         inputSchema?: ZodRawShape;
+        outputSchema?: ZodRawShape;
         annotations?: ToolAnnotations;
       },
       handler: CapturedTool["handler"],
@@ -69,6 +72,7 @@ export function createServerStub(): ServerStub {
         name,
         description: config.description,
         schema: config.inputSchema ?? {},
+        outputSchema: config.outputSchema,
         annotations: config.annotations,
         handler,
       });
@@ -118,7 +122,11 @@ export async function callTool(
 ): Promise<ToolResult> {
   const tool = requireTool(stub, name);
   const args = z.object(tool.schema).parse(rawArgs) as Record<string, unknown>;
-  return await tool.handler(args, {});
+  const result = await tool.handler(args, {});
+  if (tool.outputSchema && !result.isError) {
+    z.object(tool.outputSchema).parse(result.structuredContent);
+  }
+  return result;
 }
 
 /** Parse args through the schema without running the handler. */

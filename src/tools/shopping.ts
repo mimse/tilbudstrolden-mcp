@@ -5,13 +5,82 @@ import { calculateBasketCost, findOptimalWeek } from "../scoring.js";
 import * as store from "../store.js";
 import { scoreAllRecipes } from "./scoring.js";
 import { defaultStoresNote, errorResult, resolveStoreScope } from "./shared.js";
-import { buildShoppingList } from "./shopping-list.js";
+import { buildShoppingList, buildShoppingListDetailed } from "./shopping-list.js";
 
 interface ShoppingListArgs {
   recipes: string[];
   people?: number;
   excludePantry: boolean;
 }
+
+const shoppingDealOutputSchema = z.object({
+  id: z.string(),
+  heading: z.string(),
+  price: z.number().nullable(),
+  currency: z.string(),
+  quantity: z.number().nullable(),
+  unit: z.string().nullable(),
+  pricePerUnit: z.string().nullable(),
+  store: z.string(),
+  storeId: z.string(),
+  validFrom: z.string().nullable(),
+  validUntil: z.string().nullable(),
+});
+
+const shoppingPurchaseOutputSchema = z.object({
+  quantityNeeded: z.number(),
+  unitNeeded: z.string(),
+  packSize: z.number(),
+  packsNeeded: z.number(),
+  pricePerPack: z.number(),
+  totalCost: z.number(),
+  leftover: z.number(),
+  unitPrice: z.string().nullable(),
+});
+
+const shoppingItemOutputSchema = z.object({
+  name: z.string(),
+  category: z.string(),
+  displayQuantity: z.string(),
+  requiredQuantity: z
+    .object({
+      amount: z.number(),
+      unit: z.string(),
+    })
+    .nullable(),
+  sourceRecipes: z.array(z.string()),
+  contributions: z.array(
+    z.object({
+      recipeName: z.string(),
+      quantity: z.string(),
+      recipeServings: z.number(),
+    }),
+  ),
+  confidence: z.enum(["high", "low", "none"]),
+  estimatedCost: z.number(),
+  deal: shoppingDealOutputSchema.nullable(),
+  purchase: shoppingPurchaseOutputSchema.nullable(),
+  alternatives: z.array(
+    z.object({
+      offer: shoppingDealOutputSchema,
+      score: z.number(),
+    }),
+  ),
+  expiringSoon: z.boolean(),
+});
+
+const shoppingListOutputSchema = {
+  status: z.enum(["ok", "no_matching_recipes"]),
+  requestedRecipes: z.array(z.string()),
+  availableRecipes: z.array(z.string()),
+  matchedRecipes: z.array(z.string()),
+  householdSize: z.number().nullable(),
+  currency: z.string().nullable(),
+  currencySymbol: z.string().nullable(),
+  estimatedTotal: z.number(),
+  items: z.array(shoppingItemOutputSchema),
+  skippedPantry: z.array(z.string()),
+};
 
 async function handleGenerateShoppingList({ recipes, people, excludePantry }: ShoppingListArgs) {
   try {
@@ -22,7 +91,8 @@ async function handleGenerateShoppingList({ recipes, people, excludePantry }: Sh
     );
 
     if (selectedRecipes.length === 0) {
-      const available = allRecipes.map((r) => r.name).join(", ");
+      const availableRecipes = allRecipes.map((r) => r.name);
+      const available = availableRecipes.join(", ");
       return {
         content: [
           {
@@ -30,15 +100,37 @@ async function handleGenerateShoppingList({ recipes, people, excludePantry }: Sh
             text: `No matching recipes found. Available: ${available || "none (add recipes first)"}`,
           },
         ],
+        structuredContent: {
+          status: "no_matching_recipes" as const,
+          requestedRecipes: recipes,
+          availableRecipes,
+          matchedRecipes: [],
+          householdSize: null,
+          currency: null,
+          currencySymbol: null,
+          estimatedTotal: 0,
+          items: [],
+          skippedPantry: [],
+        },
       };
     }
 
     const household = await store.getHousehold();
     const householdSize = people ?? (household.people.length || household.defaultServings);
 
-    const text = await buildShoppingList(selectedRecipes, householdSize, undefined, excludePantry);
+    const { text, data } = await buildShoppingListDetailed(
+      selectedRecipes,
+      householdSize,
+      undefined,
+      excludePantry,
+      {
+        requestedRecipes: recipes,
+        availableRecipes: allRecipes.map((recipe) => recipe.name),
+      },
+    );
     return {
       content: [{ type: "text" as const, text }],
+      structuredContent: { ...data },
     };
   } catch (err) {
     return errorResult(
@@ -162,6 +254,7 @@ export function registerShoppingTools(server: McpServer): void {
           .default(true)
           .describe("Skip pantry items (default true)"),
       },
+      outputSchema: shoppingListOutputSchema,
       annotations: { readOnlyHint: true },
     },
     handleGenerateShoppingList,

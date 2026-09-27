@@ -100,6 +100,11 @@ describe("registerShoppingTools", () => {
     expect([...stub.tools.keys()].sort()).toEqual(["generate_shopping_list", "plan_and_shop"]);
   });
 
+  it("registers structured output only for generate_shopping_list", () => {
+    expect(stub.tools.get("generate_shopping_list")?.outputSchema).toBeDefined();
+    expect(stub.tools.get("plan_and_shop")?.outputSchema).toBeUndefined();
+  });
+
   it("tells the model when not to use each tool", () => {
     for (const tool of stub.tools.values()) {
       expect(tool.description, `${tool.name} description`).toContain("USE WHEN");
@@ -111,8 +116,24 @@ describe("registerShoppingTools", () => {
 describe("generate_shopping_list", () => {
   it("lists what is available when no recipe name matches", async () => {
     vi.mocked(store.getRecipes).mockResolvedValue([beefRecipe({ name: "Bolognese" })]);
-    const text = textOf(await callTool(stub, "generate_shopping_list", { recipes: ["Sushi"] }));
+    const result = await callTool(stub, "generate_shopping_list", { recipes: ["Sushi"] });
+    const text = textOf(result);
     expect(text).toBe("No matching recipes found. Available: Bolognese");
+    expect(result.structuredContent).toEqual({
+      status: "no_matching_recipes",
+      requestedRecipes: ["Sushi"],
+      availableRecipes: ["Bolognese"],
+      matchedRecipes: [],
+      householdSize: null,
+      currency: null,
+      currencySymbol: null,
+      estimatedTotal: 0,
+      items: [],
+      skippedPantry: [],
+    });
+    expect(store.getHousehold).not.toHaveBeenCalled();
+    expect(store.getPantry).not.toHaveBeenCalled();
+    expect(api.searchDealsBatch).not.toHaveBeenCalled();
   });
 
   it("points at add_recipe when the library is empty", async () => {
@@ -165,24 +186,45 @@ describe("generate_shopping_list", () => {
       ]),
     );
 
-    const text = textOf(
-      await callTool(stub, "generate_shopping_list", { recipes: ["Wok", "Suppe"] }),
-    );
+    const result = await callTool(stub, "generate_shopping_list", {
+      recipes: ["Wok", "Suppe"],
+    });
+    const text = textOf(result);
     // One line, both needs added up (100 g + 100 g), one pack paid for.
     expect(text).toContain("Kyllingebryst + Kyllingefilet: need 100 g + 100 g = 200 g");
     expect(text.match(/Kyllingebrystfilet @ Netto/g)).toHaveLength(1);
     expect(text).toContain("## Netto (1 items)");
+    expect(result.structuredContent?.items).toEqual([
+      expect.objectContaining({
+        name: "Kyllingebryst + Kyllingefilet",
+        requiredQuantity: { amount: 200, unit: "g" },
+        sourceRecipes: ["Wok", "Suppe"],
+        contributions: [
+          { recipeName: "Wok", quantity: "100g", recipeServings: 2 },
+          { recipeName: "Suppe", quantity: "100g", recipeServings: 2 },
+        ],
+        confidence: "high",
+        estimatedCost: 27.95,
+        deal: expect.objectContaining({ id: "chicken", storeId: "n1" }),
+        purchase: expect.objectContaining({
+          quantityNeeded: 200,
+          packSize: 280,
+          packsNeeded: 1,
+          totalCost: 27.95,
+          leftover: 80,
+        }),
+      }),
+    ]);
   });
 
   it("groups matched items under their store with pack maths and leftovers", async () => {
     vi.mocked(store.getRecipes).mockResolvedValue([beefRecipe()]);
     vi.mocked(api.searchDealsBatch).mockResolvedValue(beefDeals());
 
-    const text = textOf(
-      await callTool(stub, "generate_shopping_list", {
-        recipes: ["Bolognese"],
-      }),
-    );
+    const result = await callTool(stub, "generate_shopping_list", {
+      recipes: ["Bolognese"],
+    });
+    const text = textOf(result);
     expect(text).toContain("Shopping list for: Bolognese (2 people)");
     expect(text).toContain("Estimated register total (deals only): ~45 kr");
     expect(text).toContain("## Netto (1 items)");
@@ -192,6 +234,54 @@ describe("generate_shopping_list", () => {
     expect(text).toContain("[500 g/pack, 90.00 kr/kg]");
     expect(text).toContain("(250 g leftover)");
     expect(text).toContain("-- Hakket oksekød 8-12% @ Netto until 2026-06-30");
+    expect(result.structuredContent).toEqual({
+      status: "ok",
+      requestedRecipes: ["Bolognese"],
+      availableRecipes: ["Bolognese"],
+      matchedRecipes: ["Bolognese"],
+      householdSize: 2,
+      currency: "DKK",
+      currencySymbol: "kr",
+      estimatedTotal: 45,
+      items: [
+        {
+          name: "Hakket oksekød",
+          category: "meat",
+          displayQuantity: "250 g",
+          requiredQuantity: { amount: 250, unit: "g" },
+          sourceRecipes: ["Bolognese"],
+          contributions: [{ recipeName: "Bolognese", quantity: "500g", recipeServings: 4 }],
+          confidence: "high",
+          estimatedCost: 45,
+          deal: {
+            id: "beef",
+            heading: "Hakket oksekød 8-12%",
+            price: 45,
+            currency: "DKK",
+            quantity: 500,
+            unit: "g",
+            pricePerUnit: "90.00 kr/kg",
+            store: "Netto",
+            storeId: "n1",
+            validFrom: "2026-06-10",
+            validUntil: "2026-06-30T00:00:00Z",
+          },
+          purchase: {
+            quantityNeeded: 250,
+            unitNeeded: "g",
+            packSize: 500,
+            packsNeeded: 1,
+            pricePerPack: 45,
+            totalCost: 45,
+            leftover: 250,
+            unitPrice: "90.00 kr/kg",
+          },
+          alternatives: [],
+          expiringSoon: false,
+        },
+      ],
+      skippedPantry: [],
+    });
   });
 
   it("honours an explicit people override", async () => {
@@ -240,14 +330,27 @@ describe("generate_shopping_list", () => {
         ],
       }),
     ]);
-    const text = textOf(
-      await callTool(stub, "generate_shopping_list", {
-        recipes: ["Bolognese"],
-      }),
-    );
+    const result = await callTool(stub, "generate_shopping_list", {
+      recipes: ["Bolognese"],
+    });
+    const text = textOf(result);
     expect(text).toContain("## Buy at regular price (1 items)");
     expect(text).toContain("- Enhjørning (1 stk) [Bolognese]");
     expect(text).toContain("Estimated register total (deals only): ~0 kr");
+    expect(result.structuredContent?.items).toEqual([
+      expect.objectContaining({
+        name: "Enhjørning",
+        displayQuantity: "1 stk",
+        requiredQuantity: { amount: 1, unit: "stk" },
+        sourceRecipes: ["Bolognese"],
+        confidence: "none",
+        estimatedCost: 0,
+        deal: null,
+        purchase: null,
+        alternatives: [],
+        expiringSoon: false,
+      }),
+    ]);
   });
 
   it("skips pantry ingredients and names them at the bottom", async () => {
@@ -319,12 +422,24 @@ describe("generate_shopping_list", () => {
         ],
       }),
     ]);
-    const text = textOf(
-      await callTool(stub, "generate_shopping_list", {
-        recipes: ["Bolognese"],
-      }),
-    );
+    const result = await callTool(stub, "generate_shopping_list", {
+      recipes: ["Bolognese"],
+    });
+    const text = textOf(result);
     expect(text).toBe("All ingredients are in your pantry. Nothing to buy!");
+    expect(result.structuredContent).toEqual({
+      status: "ok",
+      requestedRecipes: ["Bolognese"],
+      availableRecipes: ["Bolognese"],
+      matchedRecipes: ["Bolognese"],
+      householdSize: 2,
+      currency: "DKK",
+      currencySymbol: "kr",
+      estimatedTotal: 0,
+      items: [],
+      skippedPantry: ["Salt"],
+    });
+    expect(api.searchDealsBatch).not.toHaveBeenCalled();
   });
 
   it("raises a buy-first section for deals expiring within two days", async () => {
@@ -333,13 +448,15 @@ describe("generate_shopping_list", () => {
       new Map([["hakket oksekød", [makeOffer({ validUntil: "2026-06-16T00:00:00Z" })]]]),
     );
 
-    const text = textOf(
-      await callTool(stub, "generate_shopping_list", {
-        recipes: ["Bolognese"],
-      }),
-    );
+    const result = await callTool(stub, "generate_shopping_list", {
+      recipes: ["Bolognese"],
+    });
+    const text = textOf(result);
     expect(text).toContain("## ⏰ Buy first (expiring soon)");
     expect(text).toContain("- Hakket oksekød: deal at Netto [expires today] (2026-06-16)");
+    expect(result.structuredContent?.items).toEqual([
+      expect.objectContaining({ name: "Hakket oksekød", expiringSoon: true }),
+    ]);
   });
 
   it("surfaces alternatives for a low-confidence match", async () => {
@@ -379,14 +496,30 @@ describe("generate_shopping_list", () => {
       ]),
     );
 
-    const text = textOf(
-      await callTool(stub, "generate_shopping_list", {
-        recipes: ["Bolognese"],
-      }),
-    );
+    const result = await callTool(stub, "generate_shopping_list", {
+      recipes: ["Bolognese"],
+    });
+    const text = textOf(result);
     expect(text).toContain("## ⚠ Uncertain matches (verify these)");
     expect(text).toContain('Mælk: picked "Øko mælk eller fløde" but also found:');
     expect(text).toContain("Sød mælk eller kærnemælk");
+    expect(result.structuredContent?.items).toEqual([
+      expect.objectContaining({
+        name: "Mælk",
+        confidence: "low",
+        deal: expect.objectContaining({ id: "m1", storeId: "n1" }),
+        alternatives: [
+          {
+            offer: expect.objectContaining({
+              id: "m2",
+              heading: "Sød mælk eller kærnemælk",
+              storeId: "n1",
+            }),
+            score: expect.any(Number),
+          },
+        ],
+      }),
+    ]);
   });
 
   it("falls back to the sticker price when the quantity cannot be parsed", async () => {
@@ -533,7 +666,8 @@ describe("plan_and_shop", () => {
     vi.mocked(store.getRecipes).mockResolvedValue(library(3));
     vi.mocked(api.searchDealsBatch).mockResolvedValue(beefDeals());
 
-    const text = textOf(await callTool(stub, "plan_and_shop", { days: 3 }));
+    const result = await callTool(stub, "plan_and_shop", { days: 3 });
+    const text = textOf(result);
     expect(text).toContain("# 3-day meal plan (2 people)");
     expect(text).toContain("Estimated basket: ~");
     expect(text).toContain("Day 1:");
@@ -544,6 +678,7 @@ describe("plan_and_shop", () => {
     expect(divider).toBeGreaterThan(-1);
     expect(text.slice(divider)).toContain("Shopping list for:");
     expect(text.slice(divider)).toContain("## Netto");
+    expect(result).not.toHaveProperty("structuredContent");
   });
 
   it("reuses the cached deal map rather than searching twice", async () => {
